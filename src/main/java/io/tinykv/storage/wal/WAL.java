@@ -78,11 +78,24 @@ public class WAL implements Closeable {
     /**
      * Rotate WAL: close current file and open a new one.
      * Called after MemTable is flushed to SSTable.
+     * Returns the sequence number of the closed WAL file (whose data has been flushed).
      */
-    public synchronized void rotate() throws IOException {
+    public synchronized long rotate() throws IOException {
         close();
+        long oldSeq = sequence.get();
         sequence.incrementAndGet();
         openNewFile();
+        return oldSeq;
+    }
+
+    /**
+     * Delete a WAL file by its sequence number.
+     * Called after the WAL's entries have been flushed to SSTable.
+     */
+    public synchronized void purge(long seq) throws IOException {
+        Path path = walDir.resolve(String.format("wal-%020d.log", seq));
+        Files.deleteIfExists(path);
+        LOG.info("Purged WAL file: {}", path);
     }
 
     /**

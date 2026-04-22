@@ -164,6 +164,7 @@ public class LSMTree implements StorageEngine {
     @Override
     public void recover() {
         try {
+            // 1. Replay WAL entries (covers crash before flush: entries not yet in SSTable)
             List<WALEntry> entries = wal.recover();
             for (WALEntry entry : entries) {
                 if (entry.type() == RecordType.PUT) {
@@ -173,8 +174,27 @@ public class LSMTree implements StorageEngine {
                 }
             }
             LOG.info("Recovered {} entries from WAL", entries.size());
+
+            // 2. Load data from SSTable (covers clean shutdown: entries already flushed)
+            for (SSTableReader reader : compaction.getAllReaders()) {
+                int count = 0;
+                try (KVIterator it = reader.iterator()) {
+                    while (it.hasNext()) {
+                        it.next();
+                        byte[] key = it.key();
+                        byte[] value = it.value();
+                        memTable.put(key, value != null ? value : new byte[0]);
+                        // Mark deletions explicitly
+                        if (value == null) {
+                            memTable.delete(key);
+                        }
+                        count++;
+                    }
+                }
+                LOG.info("Recovered {} entries from SSTable reader", count);
+            }
         } catch (IOException e) {
-            throw new StorageException("Failed to recover from WAL", e);
+            throw new StorageException("Failed to recover storage engine", e);
         }
     }
 
@@ -209,8 +229,13 @@ public class LSMTree implements StorageEngine {
         // Flush the immutable MemTable to SSTable
         compaction.flushMemTable(immutableMemTable);
 
-        // Rotate WAL
-        wal.rotate();
+        // Rotate WAL and delete the old file (its entries are now in SSTable)
+        long oldWalSeq = wal.rotate();
+        try {
+            wal.purge(oldWalSeq);
+        } catch (IOException e) {
+            LOG.warn("Failed to purge old WAL file (seq {}): {}", oldWalSeq, e.getMessage());
+        }
 
         // Clear immutable reference
         immutableMemTable = null;
@@ -219,16 +244,29 @@ public class LSMTree implements StorageEngine {
     @Override
     public void close() throws IOException {
         if (closed) return;
-        closed = true;
         lock.writeLock().lock();
+        IOException flushException = null;
         try {
             if (!memTable.isEmpty()) {
-                doFlush();
+                try {
+                    doFlush();
+                } catch (IOException e) {
+                    flushException = e;
+                }
             }
-            wal.close();
+            // Always mark as closed and clean up, even if flush failed
+            closed = true;
+            try {
+                wal.close();
+            } catch (IOException e) {
+                if (flushException == null) flushException = e;
+            }
             compaction.stop();
         } finally {
             lock.writeLock().unlock();
+        }
+        if (flushException != null) {
+            throw flushException;
         }
     }
 

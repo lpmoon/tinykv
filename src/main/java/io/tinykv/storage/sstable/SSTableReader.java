@@ -9,6 +9,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.*;
 import java.util.*;
+import java.util.NoSuchElementException;
 
 /**
  * Reads an SSTable file. Provides point lookups and range scans.
@@ -276,6 +277,11 @@ public class SSTableReader {
         private int entryIndex;
         private boolean initialized;
 
+        // Current valid entry - only valid after successful next()
+        private byte[] currentKey;
+        private byte[] currentValue;
+        private boolean hasCurrent;
+
         SSTableIterator(SSTableReader reader, Collection<BlockMeta> blocks) {
             this(reader, blocks, null, null);
         }
@@ -288,6 +294,7 @@ public class SSTableReader {
             this.blockIt = blocks.iterator();
             this.entryIndex = 0;
             this.initialized = false;
+            this.hasCurrent = false;
         }
 
         @Override
@@ -296,29 +303,48 @@ public class SSTableReader {
                 advanceToStart();
                 initialized = true;
             }
+            // Check if we have more entries in current block
+            if (currentBlock != null && entryIndex < currentBlock.getKeys().size()) {
+                byte[] key = currentBlock.getKeys().get(entryIndex);
+                // Check end key bound
+                if (endKey != null && SSTableBuilder.MemTableComparator.compare(key, endKey) > 0) {
+                    return false;
+                }
+                return true;
+            }
+            // Try to advance to next block
+            advanceBlock();
             return currentBlock != null && entryIndex < currentBlock.getKeys().size();
         }
 
         @Override
         public void next() {
-            if (!initialized) {
-                advanceToStart();
-                initialized = true;
+            if (!hasNext()) {
+                throw new NoSuchElementException();
             }
+            // Save the current entry
+            currentKey = currentBlock.getKeys().get(entryIndex);
+            currentValue = currentBlock.getValues().get(entryIndex);
+            hasCurrent = true;
+
+            // Advance for next time (but don't advance block yet)
             entryIndex++;
-            if (entryIndex >= currentBlock.getKeys().size()) {
-                advanceBlock();
-            }
         }
 
         @Override
         public byte[] key() {
-            return currentBlock.getKeys().get(entryIndex);
+            if (!hasCurrent) {
+                throw new NoSuchElementException();
+            }
+            return currentKey;
         }
 
         @Override
         public byte[] value() {
-            return currentBlock.getValues().get(entryIndex);
+            if (!hasCurrent) {
+                throw new NoSuchElementException();
+            }
+            return currentValue;
         }
 
         @Override
@@ -327,6 +353,9 @@ public class SSTableReader {
             this.entryIndex = 0;
             this.currentBlock = null;
             this.initialized = false;
+            this.hasCurrent = false;
+            this.currentKey = null;
+            this.currentValue = null;
         }
 
         @Override
@@ -335,6 +364,9 @@ public class SSTableReader {
             this.entryIndex = 0;
             this.currentBlock = null;
             this.initialized = false;
+            this.hasCurrent = false;
+            this.currentKey = null;
+            this.currentValue = null;
         }
 
         @Override

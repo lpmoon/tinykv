@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mvn test-compile *)",
+      "Bash(mvn compile *)",
+      "Bash(mkdir -p target/bench-classes)",
+      "Bash(javac -d target/bench-classes src/test/java/io/tinykv/storage/benchmark/WALBenchmark.java)",
+      "Bash(java -cp target/bench-classes io.tinykv.storage.benchmark.WALBenchmark)",
+      "Bash(mvn protobuf:compile protobuf:compile-custom)",
+      "Bash(where protoc *)",
+      "Bash(mkdir -p proto-gen)",
+      "Bash(curl -L \"https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-win32.zip\" -o proto-gen/protoc.zip)",
+      "Bash(choco install *)",
+      "Bash(curl -L --retry 3 --connect-timeout 10 \"https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-win64.zip\" -o proto-gen/protoc.zip)",
+      "Bash(unzip -o protoc-28.3-win32.zip -d proto-gen/)",
+      "Bash(mkdir -p target/generated-sources/protobuf/java target/generated-sources/protobuf/grpc-java)",
+      "Bash(./proto-gen/bin/protoc --java_out=target/generated-sources/protobuf/java --grpc_out=target/generated-sources/protobuf/grpc-java --plugin=protoc-gen-grpc=proto-gen/bin/grpc_java_plugin.exe -I src/main/proto src/main/proto/*.proto)",
+      "Bash(./proto-gen/bin/protoc --java_out=target/generated-sources/protobuf/java -I src/main/proto src/main/proto/*.proto)",
+      "Bash(curl -L --connect-timeout 15 -o proto-gen/grpc_java_plugin.exe \"https://repo1.maven.org/maven2/io/grpc/protoc-gen-grpc-java/1.62.2/protoc-gen-grpc-java-1.62.2-windows-x86_64.exe\")",
+      "Bash(./proto-gen/bin/protoc --grpc_out=target/generated-sources/protobuf/grpc-java --plugin=protoc-gen-grpc=proto-gen/grpc_java_plugin.exe -I src/main/proto src/main/proto/*.proto)",
+      "Bash(mvn test *)",
+      "Bash(java -version)",
+      "Bash(mvn -q dependency:build-classpath -Dmdep.outputFile=/dev/stdout)",
+      "Bash(javac -d target/test-classes -cp \"target/classes:$\\(mvn -q dependency:build-classpath -Dmdep.outputFile=/dev/stdout \\)\" src/test/java/io/tinykv/storage/sstable/SSTableFormatTest.java)",
+      "Bash(mvn clean *)",
+      "Bash(mvn surefire:test -Dtest=LSMTreeTest)",
+      "Bash(javap -c target/classes/io/tinykv/storage/LSMTree.class)",
+      "Bash(javap -p target/classes/io/tinykv/storage/LSMTree.class)",
+      "Bash(javap -c target/classes/io/tinykv/storage/compaction/Compaction.class)",
+      "Bash(mvn *)",
+      "Bash(git add *)"
+    ]
+  }
+}

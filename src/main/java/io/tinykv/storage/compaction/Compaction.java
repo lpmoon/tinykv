@@ -87,8 +87,14 @@ public class Compaction {
         levels.get(0).add(meta);
 
         SSTableReader reader = new SSTableReader(path);
-        reader.open();
-        readers.get(0).add(reader);
+        try {
+            reader.open();
+            readers.get(0).add(reader);
+        } catch (IOException e) {
+            LOG.warn("Failed to open newly flushed SSTable {}: {}", fileName, e.getMessage());
+            // File is on disk but reader failed - WAL recovery will reconstruct data
+            // Do not add to readers list
+        }
 
         LOG.info("Flushed MemTable to SSTable: {} ({} bytes)", fileName, fileSize);
 
@@ -194,7 +200,12 @@ public class Compaction {
                 else if (name.contains("-L2-")) level = 2;
 
                 SSTableReader reader = new SSTableReader(p);
-                reader.open();
+                try {
+                    reader.open();
+                } catch (IOException e) {
+                    LOG.warn("Failed to open SSTable {} (level {}), skipping: {}", name, level, e.getMessage());
+                    continue;
+                }
 
                 // We need smallest/largest keys from the index
                 byte[] smallest = null;
@@ -305,6 +316,12 @@ public class Compaction {
             }
         } catch (InterruptedException e) {
             compactionExecutor.shutdownNow();
+        }
+        // Close all SSTableReader instances to release file handles
+        for (List<SSTableReader> levelReaders : readers) {
+            for (SSTableReader r : levelReaders) {
+                try { r.close(); } catch (IOException ignored) {}
+            }
         }
     }
 }
