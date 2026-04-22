@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package tinykv;
+
+option java_multiple_files = true;
+option java_package = "io.tinykv.proto.coordinator";
+option java_outer_classname = "CoordinatorProto";
+
+// Coordinator service for cluster management and leader discovery
+service CoordinatorService {
+  // Node registers itself with the coordinator
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  // Node sends heartbeat to keep registration alive
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Client queries for the leader of a cluster
+  rpc GetLeader(GetLeaderRequest) returns (GetLeaderResponse);
+  // Client queries for all nodes in a cluster
+  rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
+}
+
+// ── Node Registration ─────────────────────────────────────
+
+message RegisterNodeRequest {
+  string cluster_name = 1;
+  int32 node_id = 2;
+  string node_address = 3;
+  bool is_leader = 4;
+}
+
+message RegisterNodeResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ── Heartbeat ─────────────────────────────────────────────
+
+message HeartbeatRequest {
+  string cluster_name = 1;
+  int32 node_id = 2;
+  bool is_leader = 3;
+  int64 term = 4;
+}
+
+message HeartbeatResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// ── Get Leader ────────────────────────────────────────────
+
+message GetLeaderRequest {
+  string cluster_name = 1;
+}
+
+message GetLeaderResponse {
+  bool has_leader = 1;
+  int32 leader_id = 2;
+  string leader_address = 3;
+  string cluster_name = 4;
+}
+
+// ── Get Cluster Info ───────────────────────────────────────
+
+message GetClusterInfoRequest {
+  string cluster_name = 1;
+}
+
+message GetClusterInfoResponse {
+  string cluster_name = 1;
+  int32 leader_id = 2;
+  string leader_address = 3;
+  repeated NodeInfo nodes = 4;
+}
+
+message NodeInfo {
+  int32 node_id = 1;
+  string address = 2;
+  bool is_leader = 3;
+  int64 last_heartbeat = 4;
+}
