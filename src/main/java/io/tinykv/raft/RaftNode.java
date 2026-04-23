@@ -5,7 +5,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.util.*;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Random;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -182,12 +184,17 @@ public class RaftNode {
         log.init();
 
         // 恢复持久化状态
+        // recoverHardState 返回 [currentTerm, votedFor, commitIndex, appliedIndex]
+        // appliedIndex 已经持久化，重启后直接恢复，无需重放已 apply 的日志
         long[] hs = log.recoverHardState();
         this.currentTerm = hs[0];
         this.votedFor = (int) hs[1];
         this.commitIndex = hs[2];
+        this.lastApplied = hs[3]; // 恢复 lastApplied，避免重复 apply 已持久化的日志
+        log.setAppliedIndex(this.lastApplied);
 
-        LOG.info("Raft node {} starting: term={}, commitIndex={}, state={}", id, currentTerm, commitIndex, state);
+        LOG.info("Raft node {} starting: term={}, commitIndex={}, lastApplied={}, state={}",
+                id, currentTerm, commitIndex, lastApplied, state);
 
         // 启动选举定时器
         resetElectionTimer();
@@ -306,6 +313,9 @@ public class RaftNode {
             // 不能超过自己已知的最新日志
             commitIndex = Math.min(req.leaderCommit(), log.lastLogIndex());
             log.setCommitIndex(commitIndex);
+            // 参考 etcd：follower 更新 commitIndex 时也持久化，
+            // 避免单节点重启后 apply 循环因 commitIndex 回退而停滞
+            persistState();
         }
 
         return new RaftMessage.AppendEntriesResponse(id, req.from(), currentTerm, success, log.lastLogIndex());
@@ -582,6 +592,9 @@ public class RaftNode {
             if (count >= majority) {
                 commitIndex = n;
                 log.setCommitIndex(n);
+                // 参考 etcd：commitIndex 变化时持久化 HardState，
+                // 避免全集群重启后需要重新走多数确认流程
+                persistState();
             }
         }
     }
@@ -617,6 +630,16 @@ public class RaftNode {
                             stateMachine.apply(entry.data());
                         }
                         log.setAppliedIndex(lastApplied);
+                        // 参考 etcd appliedTo() 的做法：每次 apply 后持久化 appliedIndex。
+                        // appliedIndex 是比 commitIndex 更强的恢复基准：
+                        // 已 apply 的日志一定已 commit，重启时直接从此处续接，
+                        // 无需等待 leader 心跳来重新推进 commitIndex。
+                        // 注意：这里调用 persistState() 会在 apply 线程中访问 RaftNode 的字段，
+                        // 但 log.persistHardState 只读取不可变的 currentTerm/votedFor 和
+                        // volatile 的 commitIndex/appliedIndex，线程安全。
+                        synchronized (RaftNode.this) {
+                            persistState();
+                        }
                     }
                     Thread.sleep(1); // 避免空转
                 } catch (InterruptedException e) {

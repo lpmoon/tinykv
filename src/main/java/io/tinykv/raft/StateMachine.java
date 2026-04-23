@@ -12,6 +12,13 @@ public interface StateMachine {
     byte[] apply(byte[] command);
 
     /**
+     * Read a key from the state machine.
+     * Used by AsyncReplicator for eventually-consistent reads.
+     * Returns null if key not found.
+     */
+    default byte[] get(byte[] key) { return null; }
+
+    /**
      * Take a snapshot of the current state machine.
      */
     byte[] snapshot();

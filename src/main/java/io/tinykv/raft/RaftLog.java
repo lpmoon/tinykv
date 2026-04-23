@@ -4,7 +4,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
-import java.nio.file.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -204,7 +207,12 @@ public class RaftLog {
     }
 
     /**
-     * Persist hard state (currentTerm, votedFor, commitIndex).
+     * Persist hard state (currentTerm, votedFor, commitIndex, appliedIndex).
+     *
+     * <p>参考 etcd 的做法：每当 commitIndex 或 appliedIndex 变化时都持久化，
+     * 这样重启后能尽量恢复到最新的进度，避免重复 apply 或遗漏 apply。
+     * appliedIndex 持久化后可作为恢复基准：已 apply 的日志一定已 commit，
+     * 重启时 commitIndex 至少可以恢复到 appliedIndex。
      */
     public void persistHardState(long currentTerm, int votedFor, long commitIndex) {
         try {
@@ -214,6 +222,7 @@ public class RaftLog {
                 dos.writeLong(currentTerm);
                 dos.writeInt(votedFor);
                 dos.writeLong(commitIndex);
+                dos.writeLong(appliedIndex); // 额外持久化 appliedIndex，用于重启恢复
             }
         } catch (IOException e) {
             LOG.error("Failed to persist hard state", e);
@@ -222,17 +231,26 @@ public class RaftLog {
 
     /**
      * Recover hard state from disk.
-     * Returns [currentTerm, votedFor, commitIndex].
+     * Returns [currentTerm, votedFor, commitIndex, appliedIndex].
      */
     public long[] recoverHardState() throws IOException {
         Path stateFile = Paths.get(logDir, "raft.state");
-        if (!Files.exists(stateFile)) return new long[]{0, -1, 0};
+        if (!Files.exists(stateFile)) return new long[]{0, -1, 0, 0};
 
         try (DataInputStream dis = new DataInputStream(new BufferedInputStream(Files.newInputStream(stateFile)))) {
             long currentTerm = dis.readLong();
             int votedFor = dis.readInt();
             long commitIndex = dis.readLong();
-            return new long[]{currentTerm, votedFor, commitIndex};
+            // 兼容旧格式（没有 appliedIndex 字段）
+            long appliedIndex = 0;
+            try {
+                appliedIndex = dis.readLong();
+            } catch (EOFException ignored) {
+                // 旧格式，appliedIndex 默认为 0
+            }
+            // appliedIndex 作为 commitIndex 的下界保证：
+            // 已 apply 的日志一定已 commit，所以 commitIndex >= appliedIndex
+            return new long[]{currentTerm, votedFor, Math.max(commitIndex, appliedIndex), appliedIndex};
         }
     }
 

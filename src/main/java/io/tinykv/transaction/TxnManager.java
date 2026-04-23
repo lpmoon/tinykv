@@ -1,7 +1,7 @@
 package io.tinykv.transaction;
 
-import io.tinykv.replication.SyncReplicator;
-import io.tinykv.storage.StorageEngine;
+import io.tinykv.replication.sync.SyncReplicator;
+import io.tinykv.storage.MVCCStorage;
 
 /**
  * Manages transaction lifecycle.
@@ -9,12 +9,12 @@ import io.tinykv.storage.StorageEngine;
  */
 public class TxnManager {
 
-    private final StorageEngine storageEngine;
+    private final MVCCStorage mvccStorage;
     private final SyncReplicator replicator;
     private final TimestampOracle tsOracle;
 
-    public TxnManager(StorageEngine storageEngine, SyncReplicator replicator, TimestampOracle tsOracle) {
-        this.storageEngine = storageEngine;
+    public TxnManager(MVCCStorage mvccStorage, SyncReplicator replicator, TimestampOracle tsOracle) {
+        this.mvccStorage = mvccStorage;
         this.replicator = replicator;
         this.tsOracle = tsOracle;
     }
@@ -24,7 +24,7 @@ public class TxnManager {
      */
     public Txn begin() {
         long startTs = tsOracle.next();
-        return new Txn(startTs, storageEngine, replicator, tsOracle);
+        return new Txn(startTs, mvccStorage, replicator, tsOracle);
     }
 
     /**

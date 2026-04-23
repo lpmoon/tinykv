@@ -135,60 +135,149 @@ public class Compaction {
             List<SSTableMeta> l0Files = new ArrayList<>(levels.get(0));
             if (l0Files.isEmpty()) return;
 
-            // Collect all entries from L0 and overlapping L1 files
-            List<KVIterator> iterators = new ArrayList<>();
+            // Collect L0 iterators
+            List<KVIterator> l0Iterators = new ArrayList<>();
             for (SSTableReader r : readers.get(0)) {
-                iterators.add(r.iterator());
-            }
-            // Find overlapping L1 files
-            for (SSTableMeta l1 : levels.get(1)) {
-                iterators.add(readers.get(1).get(levels.get(1).indexOf(l1)).iterator());
+                l0Iterators.add(r.iterator());
             }
 
-            // Merge and write new L1 SSTable
-            MergeIterator mergeIt = new MergeIterator(iterators);
+            // Compute L0's key range (union of all L0 files)
+            byte[] l0Start = l0Files.get(0).getSmallestKey();
+            byte[] l0End = l0Files.get(0).getLargestKey();
+            for (int i = 1; i < l0Files.size(); i++) {
+                byte[] s = l0Files.get(i).getSmallestKey();
+                byte[] e = l0Files.get(i).getLargestKey();
+                if (SSTableBuilder.MemTableComparator.compare(s, l0Start) < 0) l0Start = s;
+                if (SSTableBuilder.MemTableComparator.compare(e, l0End) > 0) l0End = e;
+            }
+
+            // Find overlapping L1 files only
+            List<SSTableMeta> overlappingL1 = new ArrayList<>();
+            for (SSTableMeta l1 : levels.get(1)) {
+                if (l1.overlapsRange(l0Start, l0End)) {
+                    overlappingL1.add(l1);
+                }
+            }
+
+            // Merge all L0 + overlapping L1 into a sorted iterator
+            List<KVIterator> allIterators = new ArrayList<>(l0Iterators);
+            for (SSTableMeta l1 : overlappingL1) {
+                int l1Idx = findReaderIndex(1, l1.getFileName());
+                if (l1Idx >= 0) {
+                    allIterators.add(readers.get(1).get(l1Idx).iterator());
+                }
+            }
+
+            MergeIterator mergeIt = new MergeIterator(allIterators);
+
+            // Write multiple L1 files, each within target size
+            long targetSize = getL1TargetSize();
             long seq = sstSeq.incrementAndGet();
-            String fileName = String.format("sst-L1-%020d.sst", seq);
-            Path path = Paths.get(sstableDir, fileName);
-            SSTableBuilder builder = new SSTableBuilder(path, config.getSstableBlockSize(), config.getBloomFilterBitsPerKey());
+            int fileIdx = 0;
 
             byte[] smallest = null;
             byte[] largest = null;
+            long currentSize = 0;
+            List<PendingEntry> entries = new ArrayList<>();
 
             while (mergeIt.hasNext()) {
                 mergeIt.next();
                 byte[] key = mergeIt.key();
                 byte[] value = mergeIt.value();
-                if (smallest == null) smallest = key.clone();
+                long entrySize = key.length + value.length;
+
+                if (smallest == null) {
+                    smallest = key.clone();
+                } else if (currentSize + entrySize > targetSize) {
+                    // Write current SSTable
+                    writeL1SSTable(seq, fileIdx++, smallest, largest, entries);
+
+                    // Reset for next SSTable
+                    smallest = key.clone();
+                    largest = null;
+                    currentSize = 0;
+                    entries = new ArrayList<>();
+                }
+
+                entries.add(new PendingEntry(key, value));
                 largest = key.clone();
-                builder.add(key, value != null ? value : new byte[0]);
+                currentSize += entrySize;
             }
 
-            long fileSize = builder.finish();
-
-            // Update metadata
-            SSTableMeta meta = new SSTableMeta(1, fileName, smallest, largest, fileSize);
-            levels.get(1).add(meta);
-
-            SSTableReader reader = new SSTableReader(path);
-            reader.open();
-            readers.get(1).add(reader);
+            // Write last SSTable
+            if (smallest != null) {
+                writeL1SSTable(seq, fileIdx, smallest, largest, entries);
+            }
 
             // Remove old L0 files
             for (SSTableMeta old : l0Files) {
-                levels.get(0).remove(old);
-                int idx = l0Files.indexOf(old);
-                if (idx < readers.get(0).size()) {
-                    readers.get(0).remove(idx).close();
-                }
-                Files.deleteIfExists(Paths.get(sstableDir, old.getFileName()));
+                removeSSTable(old, 0);
+            }
+            // Remove old overlapping L1 files
+            for (SSTableMeta old : overlappingL1) {
+                removeSSTable(old, 1);
             }
 
-            LOG.info("L0->L1 compaction complete: {} -> {} bytes", fileName, fileSize);
+            LOG.info("L0->L1 compaction complete: {} L1 files produced", fileIdx + 1);
 
         } catch (Exception e) {
             LOG.error("L0->L1 compaction failed", e);
         }
+    }
+
+    private long getL1TargetSize() {
+        // L1 target: 10MB * levelSizeMultiplier
+        return 10 * 1024 * 1024L * config.getLevelSizeMultiplier();
+    }
+
+    private void writeL1SSTable(long seq, int fileIdx, byte[] smallest, byte[] largest, List<PendingEntry> entries) throws IOException {
+        if (entries.isEmpty()) return;
+
+        String fileName = String.format("sst-L1-%020d-%03d.sst", seq, fileIdx);
+        Path path = Paths.get(sstableDir, fileName);
+        SSTableBuilder builder = new SSTableBuilder(path, config.getSstableBlockSize(), config.getBloomFilterBitsPerKey());
+
+        for (PendingEntry e : entries) {
+            builder.add(e.key, e.value);
+        }
+        long fileSize = builder.finish();
+
+        SSTableMeta meta = new SSTableMeta(1, fileName, smallest, largest, fileSize);
+        levels.get(1).add(meta);
+
+        try {
+            SSTableReader reader = new SSTableReader(path);
+            reader.open();
+            readers.get(1).add(reader);
+        } catch (IOException e) {
+            LOG.warn("Failed to open new SSTable {}: {}", fileName, e.getMessage());
+        }
+
+        LOG.debug("Wrote L1 SSTable: {} ({} bytes, {} entries)", fileName, fileSize, entries.size());
+    }
+
+    private void removeSSTable(SSTableMeta meta, int level) {
+        levels.get(level).remove(meta);
+        int idx = findReaderIndex(level, meta.getFileName());
+        if (idx >= 0) {
+            try {
+                readers.get(level).get(idx).close();
+            } catch (IOException ignored) {}
+            readers.get(level).remove(idx);
+        }
+        try {
+            Files.deleteIfExists(Paths.get(sstableDir, meta.getFileName()));
+        } catch (IOException ignored) {}
+    }
+
+    private int findReaderIndex(int level, String fileName) {
+        List<SSTableReader> rdrs = readers.get(level);
+        for (int i = 0; i < rdrs.size(); i++) {
+            if (rdrs.get(i).getFilePath().getFileName().toString().equals(fileName)) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     private void loadExistingSSTables() throws IOException {
@@ -221,6 +310,18 @@ public class Compaction {
 
                 LOG.info("Loaded existing SSTable: {} (level {})", name, level);
             }
+        }
+    }
+
+    /**
+     * A key-value entry pending to be written to an SSTable.
+     */
+    private static class PendingEntry {
+        final byte[] key;
+        final byte[] value;
+        PendingEntry(byte[] key, byte[] value) {
+            this.key = key;
+            this.value = value;
         }
     }
 

@@ -1,8 +1,9 @@
 package io.tinykv.transaction;
 
-import io.tinykv.replication.SyncReplicator;
-import io.tinykv.storage.KVIterator;
-import io.tinykv.storage.StorageEngine;
+import io.tinykv.replication.common.CommandCodec;
+import io.tinykv.replication.common.WriteOp;
+import io.tinykv.replication.sync.SyncReplicator;
+import io.tinykv.storage.MVCCStorage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -28,7 +29,7 @@ public class Txn {
     private static final Logger LOG = LoggerFactory.getLogger(Txn.class);
 
     private final long startTs;
-    private final StorageEngine storageEngine;
+    private final MVCCStorage mvccStorage;
     private final SyncReplicator replicator;
     private final TimestampOracle tsOracle;
 
@@ -39,9 +40,9 @@ public class Txn {
     private boolean committed = false;
     private boolean aborted = false;
 
-    Txn(long startTs, StorageEngine storageEngine, SyncReplicator replicator, TimestampOracle tsOracle) {
+    Txn(long startTs, MVCCStorage mvccStorage, SyncReplicator replicator, TimestampOracle tsOracle) {
         this.startTs = startTs;
-        this.storageEngine = storageEngine;
+        this.mvccStorage = mvccStorage;
         this.replicator = replicator;
         this.tsOracle = tsOracle;
     }
@@ -61,27 +62,8 @@ public class Txn {
             return Optional.of(buffered);
         }
 
-        // Read from storage engine: scan MVCC keys for this user key
-        byte[] scanStart = MVCCKey.scanStartKey(userKey, startTs);
-        byte[] scanEnd = MVCCKey.scanEndKey(userKey);
-
-        try (KVIterator it = storageEngine.scan(scanStart, scanEnd)) {
-            while (it.hasNext()) {
-                it.next();
-                byte[] rawKey = it.key();
-                byte[] value = it.value();
-
-                MVCCKey mvccKey = MVCCKey.decode(rawKey);
-                if (mvccKey.getCommitTs() <= startTs) {
-                    if (value == null || value.length == 0) {
-                        return Optional.empty(); // Deleted
-                    }
-                    return Optional.of(value);
-                }
-            }
-        }
-
-        return Optional.empty();
+        // MVCCStorage.get with explicit startTs for snapshot isolation
+        return mvccStorage.get(userKey, startTs);
     }
 
     /**
@@ -125,16 +107,16 @@ public class Txn {
         }
 
         // Build the list of MVCC writes
-        List<SyncReplicator.WriteOp> ops = new ArrayList<>();
+        List<WriteOp> ops = new ArrayList<>();
 
         for (Map.Entry<byte[], byte[]> entry : writeBuffer.entrySet()) {
             byte[] mvccKey = new MVCCKey(entry.getKey(), commitTs).encode();
-            ops.add(new SyncReplicator.WriteOp(SyncReplicator.OpType.PUT, mvccKey, entry.getValue()));
+            ops.add(new WriteOp(CommandCodec.OpType.PUT, mvccKey, entry.getValue()));
         }
 
         for (byte[] userKey : deleteSet) {
             byte[] mvccKey = new MVCCKey(userKey, commitTs).encode();
-            ops.add(new SyncReplicator.WriteOp(SyncReplicator.OpType.DELETE, mvccKey, null));
+            ops.add(new WriteOp(CommandCodec.OpType.DELETE, mvccKey, null));
         }
 
         // Write atomically through Raft
@@ -164,20 +146,9 @@ public class Txn {
         allKeys.addAll(deleteSet);
 
         for (byte[] userKey : allKeys) {
-            byte[] scanStart = MVCCKey.scanStartKey(userKey, Long.MAX_VALUE);
-            byte[] scanEnd = MVCCKey.scanEndKey(userKey);
-
-            try (KVIterator it = storageEngine.scan(scanStart, scanEnd)) {
-                while (it.hasNext()) {
-                    it.next();
-                    MVCCKey mvccKey = MVCCKey.decode(it.key());
-                    // If there's a version committed after our start_ts, it's a conflict
-                    if (mvccKey.getCommitTs() > startTs) {
-                        LOG.debug("Write-write conflict on key: committedTs={}, startTs={}",
-                                mvccKey.getCommitTs(), startTs);
-                        return true;
-                    }
-                }
+            if (mvccStorage.hasConflict(userKey, startTs)) {
+                LOG.debug("Write-write conflict on key: startTs={}", startTs);
+                return true;
             }
         }
 

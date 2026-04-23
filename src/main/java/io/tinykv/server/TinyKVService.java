@@ -3,10 +3,18 @@ package io.tinykv.server;
 import io.tinykv.common.Config;
 import io.tinykv.coordinator.CoordinatorClient;
 import io.tinykv.raft.*;
-import io.tinykv.replication.*;
+import io.tinykv.replication.async.AsyncReplicator;
+import io.tinykv.replication.async.GrpcReplicationTransport;
+import io.tinykv.replication.async.LocalReplicationTransport;
+import io.tinykv.replication.async.ReplicationTransport;
+import io.tinykv.replication.common.ReplicateResult;
+import io.tinykv.replication.common.Replicator;
+import io.tinykv.replication.sync.SyncReplicator;
 import io.tinykv.storage.LSMTree;
-import io.tinykv.storage.StorageEngine;
-import io.tinykv.transaction.*;
+import io.tinykv.storage.MVCCStorage;
+import io.tinykv.transaction.TimestampOracle;
+import io.tinykv.transaction.Txn;
+import io.tinykv.transaction.TxnManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -21,6 +29,10 @@ import java.util.concurrent.*;
  * Provides two access modes:
  * 1. Simple KV: put/get/delete/scan (goes through Raft for writes)
  * 2. Transactional: begin/commit/abort with MVCC
+ *
+ * Replication modes (configured via replicationMode):
+ * - "sync": writes go through Raft, wait for majority before returning
+ * - "async": writes apply immediately, replicate in background (Redis-style)
  */
 public class TinyKVService {
 
@@ -30,11 +42,13 @@ public class TinyKVService {
     private final int nodeId;
     private final List<Integer> peerIds;
 
-    private StorageEngine storageEngine;
+    private LSMTree storageEngine;
+    private MVCCStorage mvccStorage;
     private RaftNode raftNode;
-    private RaftTransport transport;
-    private SyncReplicator syncReplicator;
-    private AsyncReplicator asyncReplicator;
+    private RaftTransport raftTransport;
+    private Replicator replicator;
+    private AsyncReplicator asyncReplicator; // null in sync mode
+    private ReplicationTransport replicationTransport; // null in sync mode
     private TxnManager txnManager;
     private TimestampOracle tsOracle;
 
@@ -54,67 +68,116 @@ public class TinyKVService {
      * Start the TinyKV service.
      */
     public void start() throws IOException {
-        LOG.info("Starting TinyKV node {}", nodeId);
+        LOG.info("Starting TinyKV node {} (replicationMode={})", nodeId, config.getReplicationMode());
 
-        // 1. Initialize storage engine
+        // 1. Initialize storage engine + MVCC layer
         storageEngine = new LSMTree(config);
         storageEngine.recover();
+        tsOracle = new TimestampOracle();
+        mvccStorage = new MVCCStorage(storageEngine, tsOracle);
 
-        // 2. Initialize Raft
-        raftNode = new RaftNode(nodeId, peerIds, config,
-                new SyncReplicator.LSMTreeStateMachine(storageEngine));
-
-        // 3. Setup transport and wire KV service before starting
-        transport = createTransport();
-        transport.register(nodeId, raftNode);
-        raftNode.setTransport(transport);
-
-        // Wire KV gRPC service into transport before starting
-        if (transport instanceof io.tinykv.raft.GrpcTransport) {
-            ((io.tinykv.raft.GrpcTransport) transport).setKVService(this);
+        // 2. Initialize replicator based on mode.
+        String mode = config.getReplicationMode().toLowerCase();
+        if ("async".equals(mode)) {
+            initAsyncReplication();
+        } else {
+            initRaft();
+            initSyncReplication();
         }
 
-        transport.start();
-        raftNode.start();
+        // 3. Initialize transaction layer
+        txnManager = new TxnManager(mvccStorage,
+                (replicator instanceof SyncReplicator sr) ? sr : null,
+                tsOracle);
 
-        // 4. Initialize replication
-        syncReplicator = new SyncReplicator(raftNode, storageEngine, config);
-        asyncReplicator = new AsyncReplicator(raftNode, transport);
-
-        // 5. Initialize transaction layer
-        tsOracle = new TimestampOracle();
-        txnManager = new TxnManager(storageEngine, syncReplicator, tsOracle);
-
-        // 6. Register with coordinator
+        // 4. Register with coordinator
         if (config.getCoordinatorAddress() != null && !config.getCoordinatorAddress().isEmpty()) {
             registerWithCoordinator();
         }
 
         started = true;
-        LOG.info("TinyKV node {} started successfully", nodeId);
+        LOG.info("TinyKV node {} started successfully (mode={})", nodeId, mode);
+    }
+
+    private void initRaft() throws IOException {
+        raftNode = new RaftNode(nodeId, peerIds, config,
+                new SyncReplicator.LSMTreeStateMachine(mvccStorage));
+
+        raftTransport = createRaftTransport();
+        raftTransport.register(nodeId, raftNode);
+        raftNode.setTransport(raftTransport);
+
+        // Wire KV gRPC service into Raft transport before starting
+        if (raftTransport instanceof io.tinykv.raft.GrpcTransport) {
+            ((io.tinykv.raft.GrpcTransport) raftTransport).setKVService(this);
+        }
+
+        raftTransport.start();
+        raftNode.start();
+    }
+
+    private void initSyncReplication() {
+        replicator = new SyncReplicator(raftNode, mvccStorage, config);
+        replicator.start();
+    }
+
+    private void initAsyncReplication() {
+        replicationTransport = createReplicationTransport();
+        asyncReplicator = new AsyncReplicator(
+                nodeId, peerIds,
+                config.getDataDir() + "/async-repl-" + nodeId,
+                new SyncReplicator.LSMTreeStateMachine(mvccStorage),
+                replicationTransport,
+                config.getRaftHeartbeatIntervalMs(),
+                config.getRaftElectionTimeoutMs()
+        );
+        replicationTransport.register(nodeId, asyncReplicator);
+        replicationTransport.start();
+        asyncReplicator.start();
+        replicator = asyncReplicator;
     }
 
     // ==================== Simple KV API ====================
 
     /**
-     * Put a key-value pair (sync replicated via Raft).
+     * Put a key-value pair using the configured replication mode.
+     * In async mode with waitReplicas > 0, automatically waits for N replicas.
      */
-    public void put(byte[] key, byte[] value) throws InterruptedException, TimeoutException {
-        syncReplicator.put(key, value);
+    public CompletableFuture<ReplicateResult> put(byte[] key, byte[] value) {
+        CompletableFuture<ReplicateResult> future = replicator.put(key, value);
+        if (config.getWaitReplicas() > 0 && asyncReplicator != null) {
+            return future.thenApply(result -> {
+                if (result.success()) {
+                    asyncReplicator.wait(result.index(), config.getWaitReplicas(), 5000);
+                }
+                return result;
+            });
+        }
+        return future;
     }
 
     /**
      * Get a value by key.
      */
     public Optional<byte[]> get(byte[] key) {
-        return syncReplicator.get(key);
+        return replicator.get(key);
     }
 
     /**
-     * Delete a key (sync replicated via Raft).
+     * Delete a key using the configured replication mode.
+     * In async mode with waitReplicas > 0, automatically waits for N replicas.
      */
-    public void delete(byte[] key) throws InterruptedException, TimeoutException {
-        syncReplicator.delete(key);
+    public CompletableFuture<ReplicateResult> delete(byte[] key) {
+        CompletableFuture<ReplicateResult> future = replicator.delete(key);
+        if (config.getWaitReplicas() > 0 && asyncReplicator != null) {
+            return future.thenApply(result -> {
+                if (result.success()) {
+                    asyncReplicator.wait(result.index(), config.getWaitReplicas(), 5000);
+                }
+                return result;
+            });
+        }
+        return future;
     }
 
     /**
@@ -122,6 +185,15 @@ public class TinyKVService {
      */
     public Iterator<KVEntry> scan(byte[] startKey, byte[] endKey) {
         return new ScanIterator(storageEngine.scan(startKey, endKey));
+    }
+
+    // ==================== Replication Info ====================
+
+    /**
+     * Get the current replication mode.
+     */
+    public String getReplicationMode() {
+        return asyncReplicator != null ? "async" : "sync";
     }
 
     // ==================== Transaction API ====================
@@ -140,38 +212,26 @@ public class TinyKVService {
         txnManager.execute(callback);
     }
 
-    // ==================== Async Replication API ====================
-
-    /**
-     * Add a learner node for async replication.
-     */
-    public void addLearner(RaftNode learner) {
-        asyncReplicator.addLearner(learner);
-    }
-
-    /**
-     * Get replication lag for a learner.
-     */
-    public long getLearnerLag(int learnerId) {
-        return asyncReplicator.getReplicationLag(learnerId);
-    }
-
     // ==================== Info ====================
 
     public RaftState getRaftState() {
-        return raftNode.getState();
+        // async 模式没有 RaftNode，用 FOLLOWER 占位（由 AsyncReplicator 自己管选举状态）
+        return raftNode != null ? raftNode.getState() : RaftState.FOLLOWER;
     }
 
     public int getLeaderId() {
-        return raftNode.getLeaderId();
+        // AsyncReplicator 没有暴露 getLeaderId()，async 模式下返回 -1（未知）
+        return raftNode != null ? raftNode.getLeaderId() : -1;
     }
 
     public long getCommitIndex() {
-        return raftNode.getCommitIndex();
+        return raftNode != null ? raftNode.getCommitIndex() :
+                (asyncReplicator != null ? asyncReplicator.getCommitIndex() : 0);
     }
 
     public boolean isLeader() {
-        return raftNode.isLeader();
+        return raftNode != null ? raftNode.isLeader() :
+                (asyncReplicator != null && asyncReplicator.isLeader());
     }
 
     // ==================== Lifecycle ====================
@@ -192,9 +252,21 @@ public class TinyKVService {
             coordinatorClient.close();
         }
 
-        asyncReplicator.stop();
-        raftNode.stop();
-        transport.stop();
+        // Stop replicators
+        if (asyncReplicator != null) {
+            asyncReplicator.stop();
+        }
+        if (replicationTransport != null) {
+            replicationTransport.stop();
+        }
+
+        // async 模式下 raftNode/raftTransport 未初始化，跳过
+        if (raftNode != null) {
+            raftNode.stop();
+        }
+        if (raftTransport != null) {
+            raftTransport.stop();
+        }
 
         try {
             storageEngine.close();
@@ -213,7 +285,6 @@ public class TinyKVService {
 
         coordinatorClient = new CoordinatorClient(config.getCoordinatorAddress());
 
-        // Register node
         boolean success = coordinatorClient.registerNode(
                 config.getClusterName(),
                 nodeId,
@@ -248,28 +319,30 @@ public class TinyKVService {
         }, 1000, 3000, TimeUnit.MILLISECONDS);
     }
 
-    private RaftTransport createTransport() {
-        // Use gRPC transport for real cluster communication
+    private RaftTransport createRaftTransport() {
         if (config.getPeerAddresses() != null && !config.getPeerAddresses().isEmpty()) {
             return new GrpcTransport(config);
         }
-        // Fall back to local transport for single-node or testing
         return new LocalTransport();
     }
 
+    private ReplicationTransport createReplicationTransport() {
+        if (config.getPeerAddresses() != null && !config.getPeerAddresses().isEmpty()) {
+            return new GrpcReplicationTransport(config);
+        }
+        return new LocalReplicationTransport();
+    }
+
     private int parseNodeId(Config config) {
-        // First check all peer addresses to find our ID
         Map<Integer, String> peerAddresses = config.getAllPeerAddresses();
         String ourAddress = config.getAddress();
 
-        // Find our own node ID
         for (Map.Entry<Integer, String> entry : peerAddresses.entrySet()) {
             if (entry.getValue().equals(ourAddress)) {
                 return entry.getKey();
             }
         }
 
-        // Fallback: parse node ID from address format "nodeId:host:port"
         String[] parts = ourAddress.split(":");
         if (parts.length >= 3) {
             try {
@@ -279,7 +352,6 @@ public class TinyKVService {
             }
         }
 
-        // If just "host:port", derive ID from port
         return Integer.parseInt(parts[parts.length - 1]) % 100;
     }
 

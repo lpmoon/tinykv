@@ -42,6 +42,10 @@ public class Config {
     private String clusterName = "default";
     private String coordinatorAddress = "";
 
+    // Replication
+    private String replicationMode = "sync"; // "sync" or "async"
+    private int waitReplicas = 0; // 0 = no wait (fire-and-forget)
+
     // Getters
     public String getDataDir() { return dataDir; }
     public long getMemTableSize() { return memTableSize; }
@@ -64,6 +68,8 @@ public class Config {
     public String getPeerAddresses() { return peerAddresses; }
     public String getClusterName() { return clusterName; }
     public String getCoordinatorAddress() { return coordinatorAddress; }
+    public String getReplicationMode() { return replicationMode; }
+    public int getWaitReplicas() { return waitReplicas; }
 
     public String getPeerAddress(int nodeId) {
         return peerAddressMap.get(nodeId);
@@ -86,6 +92,8 @@ public class Config {
     }
     public Config setClusterName(String clusterName) { this.clusterName = clusterName; return this; }
     public Config setCoordinatorAddress(String coordinatorAddress) { this.coordinatorAddress = coordinatorAddress; return this; }
+    public Config setReplicationMode(String mode) { this.replicationMode = mode; return this; }
+    public Config setWaitReplicas(int n) { this.waitReplicas = n; return this; }
     public Config setRaftElectionTimeoutMs(int ms) { this.raftElectionTimeoutMs = ms; return this; }
     public Config setRaftHeartbeatIntervalMs(int ms) { this.raftHeartbeatIntervalMs = ms; return this; }
     public Config setRaftMaxEntriesPerAppend(int max) { this.raftMaxEntriesPerAppend = max; return this; }
