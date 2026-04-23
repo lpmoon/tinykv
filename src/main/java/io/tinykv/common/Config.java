@@ -1,5 +1,7 @@
 package io.tinykv.common;
 
+import io.tinykv.storage.memtable.MemTableType;
+
 import java.util.HashMap;
 import java.util.Map;
 
@@ -11,6 +13,9 @@ public class Config {
     // Storage
     private String dataDir = "/tmp/tinykv/data";
     private long memTableSize = 64 * 1024 * 1024; // 64MB
+    private int maxWriteBufferNumber = 4;         // Max total memtables (active + immutable)
+    private MemTableType memTableType = MemTableType.SKIP_LIST; // MemTable type
+    private int hashBuckets = 16;                 // For HashSkipList only
     private int sstableBlockSize = 4 * 1024;       // 4KB
     private int blockSize = 4096;
     private int bloomFilterBitsPerKey = 10;
@@ -49,6 +54,9 @@ public class Config {
     // Getters
     public String getDataDir() { return dataDir; }
     public long getMemTableSize() { return memTableSize; }
+    public int getMaxWriteBufferNumber() { return maxWriteBufferNumber; }
+    public MemTableType getMemTableType() { return memTableType; }
+    public int getHashBuckets() { return hashBuckets; }
     public int getSstableBlockSize() { return sstableBlockSize; }
     public int getBlockSize() { return blockSize; }
     public int getBloomFilterBitsPerKey() { return bloomFilterBitsPerKey; }
@@ -82,6 +90,9 @@ public class Config {
     // Setters
     public Config setDataDir(String dataDir) { this.dataDir = dataDir; return this; }
     public Config setMemTableSize(long memTableSize) { this.memTableSize = memTableSize; return this; }
+    public Config setMaxWriteBufferNumber(int n) { this.maxWriteBufferNumber = n; return this; }
+    public Config setMemTableType(MemTableType type) { this.memTableType = type; return this; }
+    public Config setHashBuckets(int n) { this.hashBuckets = n; return this; }
     public Config setPort(int port) { this.port = port; return this; }
     public Config setPeers(String peers) { this.peers = peers; return this; }
     public Config setAddress(String address) { this.address = address; return this; }

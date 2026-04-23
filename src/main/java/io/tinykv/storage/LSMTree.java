@@ -4,6 +4,7 @@ import io.tinykv.common.Config;
 import io.tinykv.common.Record.RecordType;
 import io.tinykv.storage.compaction.Compaction;
 import io.tinykv.storage.memtable.MemTable;
+import io.tinykv.storage.memtable.MemTableFactory;
 import io.tinykv.storage.sstable.SSTableReader;
 import io.tinykv.storage.wal.WAL;
 import io.tinykv.storage.wal.WALEntry;
@@ -15,11 +16,12 @@ import java.util.*;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
- * LSM-Tree based storage engine implementation.
+ * LSM-Tree based storage engine implementation with multiple memtables.
  *
- * Write path:  WAL -> MemTable -> (flush) -> SSTable
- * Read path:   MemTable -> Immutable MemTable -> SSTable (L0 -> L1 -> ...)
- * Scan path:   Merge iterator across all levels
+ * Write path:  WAL -> MemTable -> (full) -> Immutable Queue -> (flush) -> SSTable
+ * Read path:   MemTable -> Immutable MemTables (newest first) -> SSTable (L0 -> L1 -> ...)
+ *
+ * Inspired by RocksDB's memtable architecture.
  */
 public class LSMTree implements StorageEngine {
 
@@ -27,20 +29,43 @@ public class LSMTree implements StorageEngine {
 
     private final Config config;
     private MemTable memTable;
-    private MemTable immutableMemTable;
+    private final LinkedList<MemTableWithWal> immutableMemTables;
     private final WAL wal;
     private final Compaction compaction;
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
     private volatile boolean closed = false;
 
+    /**
+     * MemTable + its corresponding WAL sequence number.
+     */
+    private static class MemTableWithWal {
+        final MemTable memTable;
+        final long walSeq;
+
+        MemTableWithWal(MemTable memTable, long walSeq) {
+            this.memTable = memTable;
+            this.walSeq = walSeq;
+        }
+    }
+
     public LSMTree(Config config) throws IOException {
         this.config = config;
-        this.memTable = new MemTable();
-        this.immutableMemTable = null;
+        this.memTable = createNewMemTable();
+        this.immutableMemTables = new LinkedList<>();
         this.wal = new WAL(config.getDataDir() + "/wal");
         this.compaction = new Compaction(config);
         this.compaction.start();
+    }
+
+    /**
+     * Create a new memtable based on config.
+     */
+    private MemTable createNewMemTable() {
+        if (config.getMemTableType() == null) {
+            return MemTableFactory.create(io.tinykv.storage.memtable.MemTableType.SKIP_LIST);
+        }
+        return MemTableFactory.create(config.getMemTableType(), config.getHashBuckets());
     }
 
     @Override
@@ -50,7 +75,7 @@ public class LSMTree implements StorageEngine {
             WALEntry entry = new WALEntry(RecordType.PUT, key, value);
             wal.append(entry);
             memTable.put(key, value);
-            maybeFlush();
+            maybeSwitchMemTable();
         } catch (IOException e) {
             throw new StorageException("Failed to put key", e);
         } finally {
@@ -62,7 +87,7 @@ public class LSMTree implements StorageEngine {
     public Optional<byte[]> get(byte[] key) {
         lock.readLock().lock();
         try {
-            // 1. Check MemTable
+            // 1. Check active MemTable (newest)
             byte[] value = memTable.get(key);
             if (value != null) {
                 return Optional.of(value);
@@ -71,13 +96,13 @@ public class LSMTree implements StorageEngine {
                 return Optional.empty();
             }
 
-            // 2. Check Immutable MemTable
-            if (immutableMemTable != null) {
-                value = immutableMemTable.get(key);
+            // 2. Check Immutable MemTables (newest first, since they're added to head)
+            for (MemTableWithWal mt : immutableMemTables) {
+                value = mt.memTable.get(key);
                 if (value != null) {
                     return Optional.of(value);
                 }
-                if (immutableMemTable.isDeleted(key)) {
+                if (mt.memTable.isDeleted(key)) {
                     return Optional.empty();
                 }
             }
@@ -103,7 +128,7 @@ public class LSMTree implements StorageEngine {
             WALEntry entry = new WALEntry(RecordType.DELETE, key, null);
             wal.append(entry);
             memTable.delete(key);
-            maybeFlush();
+            maybeSwitchMemTable();
         } catch (IOException e) {
             throw new StorageException("Failed to delete key", e);
         } finally {
@@ -128,7 +153,7 @@ public class LSMTree implements StorageEngine {
                     memTable.delete(e.key());
                 }
             }
-            maybeFlush();
+            maybeSwitchMemTable();
         } catch (IOException e) {
             throw new StorageException("Failed to write batch", e);
         } finally {
@@ -142,12 +167,12 @@ public class LSMTree implements StorageEngine {
         try {
             List<KVIterator> iterators = new ArrayList<>();
 
-            // MemTable
+            // Active MemTable (newest)
             iterators.add(memTable.iterator(startKey, endKey));
 
-            // Immutable MemTable
-            if (immutableMemTable != null) {
-                iterators.add(immutableMemTable.iterator(startKey, endKey));
+            // Immutable MemTables (newest first)
+            for (MemTableWithWal mt : immutableMemTables) {
+                iterators.add(mt.memTable.iterator(startKey, endKey));
             }
 
             // SSTables
@@ -202,71 +227,119 @@ public class LSMTree implements StorageEngine {
     public void flush() {
         lock.writeLock().lock();
         try {
-            doFlush();
+            // Switch current memtable if not empty
+            if (!memTable.isEmpty()) {
+                switchMemTable();
+            }
+            // Flush all immutable memtables
+            while (!immutableMemTables.isEmpty()) {
+                flushOldestImmutable();
+            }
         } catch (IOException e) {
-            throw new StorageException("Failed to flush MemTable", e);
+            throw new StorageException("Failed to flush", e);
         } finally {
             lock.writeLock().unlock();
         }
     }
 
-    private void maybeFlush() throws IOException {
+    /**
+     * Check if we need to switch to a new memtable.
+     */
+    private void maybeSwitchMemTable() throws IOException {
         if (memTable.approximateSize() >= config.getMemTableSize()) {
-            doFlush();
+            switchMemTable();
         }
     }
 
-    private void doFlush() throws IOException {
-        if (memTable.isEmpty()) return;
-
-        // Swap: current MemTable becomes immutable, create fresh MemTable
-        immutableMemTable = memTable;
-        memTable = new MemTable();
-
-        LOG.info("Flushing MemTable (approx {} bytes, {} entries)",
-                immutableMemTable.approximateSize(), immutableMemTable.entryCount());
-
-        // Flush the immutable MemTable to SSTable
-        compaction.flushMemTable(immutableMemTable);
-
-        // Rotate WAL and delete the old file (its entries are now in SSTable)
-        long oldWalSeq = wal.rotate();
-        try {
-            wal.purge(oldWalSeq);
-        } catch (IOException e) {
-            LOG.warn("Failed to purge old WAL file (seq {}): {}", oldWalSeq, e.getMessage());
+    /**
+     * Switch current memtable to immutable and create new active memtable.
+     * May block (write stall) if we hit max write buffer number limit.
+     */
+    private void switchMemTable() throws IOException {
+        // Write stall: if too many immutable memtables, flush the oldest one first
+        while (immutableMemTables.size() >= config.getMaxWriteBufferNumber() - 1) {
+            LOG.warn("Write stall: {} immutable memtables waiting (max {}), flushing oldest",
+                    immutableMemTables.size(), config.getMaxWriteBufferNumber() - 1);
+            flushOldestImmutable();
         }
 
-        // Clear immutable reference
-        immutableMemTable = null;
+        if (memTable.isEmpty()) return;
+
+        // Rotate WAL first
+        long walSeq = wal.rotate();
+
+        // Swap: current MemTable becomes immutable, create fresh MemTable
+        MemTable oldMemTable = memTable;
+        memTable = createNewMemTable();
+        immutableMemTables.addFirst(new MemTableWithWal(oldMemTable, walSeq));
+
+        LOG.info("Switched MemTable (approx {} bytes, {} entries), immutable queue size: {}",
+                oldMemTable.approximateSize(), oldMemTable.entryCount(), immutableMemTables.size());
+    }
+
+    /**
+     * Flush the oldest immutable memtable to SSTable (must hold write lock).
+     */
+    private void flushOldestImmutable() throws IOException {
+        if (immutableMemTables.isEmpty()) {
+            return;
+        }
+
+        MemTableWithWal toFlush = immutableMemTables.removeLast();
+
+        LOG.info("Flushing immutable MemTable (approx {} bytes, {} entries)",
+                toFlush.memTable.approximateSize(), toFlush.memTable.entryCount());
+
+        // Flush the immutable MemTable to SSTable
+        compaction.flushMemTable(toFlush.memTable);
+
+        // Purge old WAL file now that its entries are safely in SSTable
+        try {
+            wal.purge(toFlush.walSeq);
+        } catch (IOException e) {
+            LOG.warn("Failed to purge old WAL file (seq {}): {}", toFlush.walSeq, e.getMessage());
+        }
     }
 
     @Override
     public void close() throws IOException {
         if (closed) return;
         lock.writeLock().lock();
-        IOException flushException = null;
+        IOException firstException = null;
         try {
+            // Switch current memtable to immutable if not empty
             if (!memTable.isEmpty()) {
                 try {
-                    doFlush();
+                    long walSeq = wal.rotate();
+                    immutableMemTables.addFirst(new MemTableWithWal(memTable, walSeq));
+                    memTable = createNewMemTable();
                 } catch (IOException e) {
-                    flushException = e;
+                    if (firstException == null) firstException = e;
                 }
             }
-            // Always mark as closed and clean up, even if flush failed
+
+            // Flush all immutable memtables
+            while (!immutableMemTables.isEmpty()) {
+                try {
+                    flushOldestImmutable();
+                } catch (IOException e) {
+                    if (firstException == null) firstException = e;
+                }
+            }
+
+            // Always mark as closed and clean up
             closed = true;
             try {
                 wal.close();
             } catch (IOException e) {
-                if (flushException == null) flushException = e;
+                if (firstException == null) firstException = e;
             }
             compaction.stop();
         } finally {
             lock.writeLock().unlock();
         }
-        if (flushException != null) {
-            throw flushException;
+        if (firstException != null) {
+            throw firstException;
         }
     }
 

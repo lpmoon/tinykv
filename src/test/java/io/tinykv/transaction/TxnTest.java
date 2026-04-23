@@ -1,8 +1,5 @@
 package io.tinykv.transaction;
 
-import io.tinykv.common.Config;
-import io.tinykv.raft.*;
-import io.tinykv.replication.*;
 import io.tinykv.storage.*;
 import org.junit.jupiter.api.*;
 

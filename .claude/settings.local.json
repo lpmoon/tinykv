@@ -28,7 +28,8 @@
       "Bash(javap -p target/classes/io/tinykv/storage/LSMTree.class)",
       "Bash(javap -c target/classes/io/tinykv/storage/compaction/Compaction.class)",
       "Bash(mvn *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "WebSearch"
     ]
   }
 }
