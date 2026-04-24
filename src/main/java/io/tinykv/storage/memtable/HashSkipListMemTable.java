@@ -246,7 +246,12 @@ public class HashSkipListMemTable implements MemTable {
             heap.clear();
             currentEntry = null;
             for (int i = 0; i < maps.size(); i++) {
-                NavigableMap<byte[], byte[]> map = maps.get(i).tailMap(target, true);
+                NavigableMap<byte[], byte[]> map;
+                if (target != null) {
+                    map = maps.get(i).tailMap(target, true);
+                } else {
+                    map = maps.get(i);
+                }
                 Iterator<Map.Entry<byte[], byte[]>> it = map.entrySet().iterator();
                 if (it.hasNext()) {
                     Map.Entry<byte[], byte[]> e = it.next();
@@ -257,7 +262,16 @@ public class HashSkipListMemTable implements MemTable {
 
         @Override
         public void seekToFirst() {
-            seek(null);
+            // Reset and reinitialize from start
+            heap.clear();
+            currentEntry = null;
+            for (int i = 0; i < maps.size(); i++) {
+                Iterator<Map.Entry<byte[], byte[]>> it = maps.get(i).entrySet().iterator();
+                if (it.hasNext()) {
+                    Map.Entry<byte[], byte[]> e = it.next();
+                    heap.add(new HeapEntry(e.getKey(), e.getValue(), i));
+                }
+            }
         }
 
         @Override
