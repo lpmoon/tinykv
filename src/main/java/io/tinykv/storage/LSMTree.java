@@ -163,6 +163,11 @@ public class LSMTree implements StorageEngine {
 
     @Override
     public KVIterator scan(byte[] startKey, byte[] endKey) {
+        return scan(startKey, endKey, false);
+    }
+
+    @Override
+    public KVIterator scan(byte[] startKey, byte[] endKey, boolean includeTombstones) {
         lock.readLock().lock();
         try {
             List<KVIterator> iterators = new ArrayList<>();
@@ -180,7 +185,7 @@ public class LSMTree implements StorageEngine {
                 iterators.add(reader.iterator(startKey, endKey));
             }
 
-            return new MergingIterator(iterators);
+            return new MergingIterator(iterators, includeTombstones);
         } finally {
             lock.readLock().unlock();
         }
@@ -350,6 +355,7 @@ public class LSMTree implements StorageEngine {
 
         private final List<KVIterator> iterators;
         private final PriorityQueue<IterEntry> heap;
+        private final boolean includeTombstones;
         private byte[] currentKey;
         private byte[] currentValue;
         private boolean hasCurrent;
@@ -369,7 +375,7 @@ public class LSMTree implements StorageEngine {
 
             @Override
             public int compareTo(IterEntry o) {
-                int cmp = MemTable.compareBytes(this.key, o.key);
+                int cmp = io.tinykv.storage.memtable.MemTable.compareBytes(this.key, o.key);
                 if (cmp != 0) return cmp;
                 // Newer sources (lower index) win on ties
                 return Integer.compare(this.sourceIndex, o.sourceIndex);
@@ -377,7 +383,12 @@ public class LSMTree implements StorageEngine {
         }
 
         MergingIterator(List<KVIterator> iterators) {
+            this(iterators, false);
+        }
+
+        MergingIterator(List<KVIterator> iterators, boolean includeTombstones) {
             this.iterators = iterators;
+            this.includeTombstones = includeTombstones;
             this.heap = new PriorityQueue<>();
             for (int i = 0; i < iterators.size(); i++) {
                 KVIterator it = iterators.get(i);
@@ -469,8 +480,8 @@ public class LSMTree implements StorageEngine {
                     refill(dup);
                 }
 
-                // Skip tombstones (null value means deleted)
-                if (currentValue == null) {
+                // Skip tombstones (null value means deleted) unless includeTombstones is true
+                if (!includeTombstones && currentValue == null) {
                     hasCurrent = false;
                     continue;
                 }

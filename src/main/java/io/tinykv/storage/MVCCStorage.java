@@ -73,9 +73,8 @@ public class MVCCStorage {
      */
     public Optional<byte[]> get(byte[] userKey, long readTs) throws IOException {
         byte[] startKey = MVCCKey.scanStartKey(userKey, readTs);
-        byte[] endKey = MVCCKey.scanEndKey(userKey);
 
-        try (KVIterator it = engine.scan(startKey, endKey)) {
+        try (KVIterator it = engine.scan(startKey, null, true)) {
             while (it.hasNext()) {
                 it.next();
                 byte[] internalKey = it.key();
@@ -121,14 +120,20 @@ public class MVCCStorage {
      */
     public void writeTxnBatch(List<WriteOp> ops) {
         Batch batch = new Batch();
+        long maxCommitTs = 0;
         for (WriteOp op : ops) {
             if (op.type() == CommandCodec.OpType.PUT) {
                 batch.put(op.key(), op.value());
             } else {
                 batch.delete(op.key());
             }
+            // Extract commitTs from MVCCKey to update lastCommitTs
+            MVCCKey mvccKey = MVCCKey.decode(op.key());
+            maxCommitTs = Math.max(maxCommitTs, mvccKey.getCommitTs());
         }
         engine.write(batch);
+        lastCommitTs = Math.max(lastCommitTs, maxCommitTs);
+        LOG.debug("MVCCStorage.writeTxnBatch: wrote {} ops, lastCommitTs={}", ops.size(), lastCommitTs);
     }
 
     /**
@@ -141,9 +146,8 @@ public class MVCCStorage {
      */
     public boolean hasConflict(byte[] userKey, long startTs) throws IOException {
         byte[] scanStart = MVCCKey.scanStartKey(userKey, Long.MAX_VALUE);
-        byte[] scanEnd = MVCCKey.scanEndKey(userKey);
 
-        try (KVIterator it = engine.scan(scanStart, scanEnd)) {
+        try (KVIterator it = engine.scan(scanStart, null)) {
             while (it.hasNext()) {
                 it.next();
                 MVCCKey mvccKey = MVCCKey.decode(it.key());

@@ -36,6 +36,11 @@ public interface StorageEngine extends Closeable {
     KVIterator scan(byte[] startKey, byte[] endKey);
 
     /**
+     * Scan keys in [startKey, endKey) range, optionally including tombstones.
+     */
+    KVIterator scan(byte[] startKey, byte[] endKey, boolean includeTombstones);
+
+    /**
      * Recover state from WAL on startup.
      */
     void recover();

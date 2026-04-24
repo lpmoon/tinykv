@@ -86,6 +86,10 @@ public class SkipListMemTable implements MemTable {
     public KVIterator iterator(byte[] startKey, byte[] endKey) {
         ConcurrentNavigableMap<byte[], byte[]> subMap;
         if (startKey != null && endKey != null) {
+            // If startKey >= endKey, return empty iterator
+            if (MemTable.compareBytes(startKey, endKey) >= 0) {
+                return new SkipListMemTableIterator(new ConcurrentSkipListMap<>(MemTable::compareBytes));
+            }
             subMap = table.subMap(startKey, true, endKey, false);
         } else if (startKey != null) {
             subMap = table.tailMap(startKey, true);
